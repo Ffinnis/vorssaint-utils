@@ -24,6 +24,7 @@ enum NotchAgentTests {
         liveTurns(suite)
         reading(suite)
         AgentUsageReadTests.run(suite)
+        AgentUsageArchiveTests.run(suite)
         claudeApp(suite)
         preferences(suite)
         formatting(suite)

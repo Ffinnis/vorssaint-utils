@@ -181,6 +181,44 @@ final class AgentUsageStore {
         waiting = waiting.filter { now.timeIntervalSince($0.value.lastActivity) < Self.resumeWindow(for: $0.value.provider) }
     }
 
+    /// What is kept between launches: every counter the logs gave, and none
+    /// of their text.
+    struct Saved: Equatable {
+        struct Record: Equatable {
+            let key: String
+            let record: AgentUsageRecord
+            let billable: AgentBillable
+        }
+
+        var records: [Record] = []
+        var limits: [AgentLimits] = []
+        var codexPlan: String?
+        var codexPlanObserved = Date.distantPast
+        var turns: [AgentLiveSession] = []
+        var waiting: [AgentLiveSession] = []
+    }
+
+    var saved: Saved {
+        var keys = [String](repeating: "", count: records.count)
+        for (key, position) in index { keys[position] = key }
+        return Saved(records: records.indices.map { Saved.Record(key: keys[$0], record: records[$0], billable: billables[$0]) },
+                     limits: limits.values.sorted { $0.provider.rawValue < $1.provider.rawValue },
+                     codexPlan: codexPlan, codexPlanObserved: codexPlanObserved,
+                     turns: turns.values.sorted { $0.id < $1.id }, waiting: waiting.values.sorted { $0.id < $1.id })
+    }
+
+    convenience init(saved: Saved) {
+        self.init()
+        records = saved.records.map(\.record)
+        billables = saved.records.map(\.billable)
+        for (position, entry) in saved.records.enumerated() { index[entry.key] = position }
+        limits = Dictionary(saved.limits.map { ($0.provider, $0) }, uniquingKeysWith: { $1 })
+        codexPlan = saved.codexPlan
+        codexPlanObserved = saved.codexPlanObserved
+        turns = Dictionary(saved.turns.map { ($0.id, $0) }, uniquingKeysWith: { $1 })
+        waiting = Dictionary(saved.waiting.map { ($0.id, $0) }, uniquingKeysWith: { $1 })
+    }
+
     /// Keeps memory bounded to the history the island can show.
     func dropRecords(before date: Date) {
         guard records.contains(where: { $0.date < date }) else { return }
@@ -249,6 +287,32 @@ final class AgentLogCursor {
         let parent = provider == .claude ? AgentLogCursor.parent(of: path) : nil
         self.parent = parent
         tracksTurns = provider == .claude ? parent == nil : !name.contains("_")
+    }
+
+    /// Where reading stopped, at a line boundary: a line still being written
+    /// is read again whole from the file.
+    struct Saved: Equatable {
+        let path: String
+        let provider: AgentProvider
+        let offset: UInt64
+        let identity: UInt64
+        let discarding: Bool
+        let modified: Date
+        let state: AgentLogState
+    }
+
+    var saved: Saved {
+        Saved(path: path, provider: provider, offset: discarding ? offset : offset - UInt64(pending.count),
+              identity: identity, discarding: discarding, modified: modified, state: state)
+    }
+
+    convenience init(saved: Saved) {
+        self.init(path: saved.path, provider: saved.provider)
+        offset = saved.offset
+        identity = saved.identity
+        discarding = saved.discarding
+        modified = saved.modified
+        state = saved.state
     }
 
     /// Claude Code keeps a session's subagents in `<session>/subagents/`,

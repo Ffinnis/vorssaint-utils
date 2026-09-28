@@ -6,12 +6,15 @@ import Foundation
 
 /// Reads Claude Code and Codex usage from their local session logs while the
 /// AI section is on, along with the plan limits the Claude app saves. The
-/// files are read where they are, incrementally, and nothing is copied,
-/// stored or sent: only counters stay in memory. The one request it makes
-/// fetches the public price list, when the person keeps prices up to date.
+/// files are read where they are, incrementally, and nothing is copied or
+/// sent: only counters are kept, in memory and in the app's private folder
+/// so the next launch reads only what the agents wrote meanwhile. The one
+/// request it makes fetches the public price list, when the person keeps
+/// prices up to date.
 ///
-/// Reading happens on a private queue; the main thread and that queue only
-/// ever hand work to each other asynchronously.
+/// Reading happens on a private queue; the main thread and that queue hand
+/// work to each other asynchronously, except that a stop waits for progress
+/// to be saved. The queue never waits for the main thread.
 final class AgentUsageService: ObservableObject {
     static let shared = AgentUsageService()
 
@@ -32,6 +35,9 @@ final class AgentUsageService: ObservableObject {
     private static let pollWindow: TimeInterval = 30 * 60
     /// Coalesce a live log's bursts into one history and display update.
     private static let publishDelay: TimeInterval = 1
+    /// How often progress is saved while agents write, besides on quit and
+    /// pause; a launch after a crash reads again only what came after.
+    private static let saveInterval: TimeInterval = 5 * 60
 
     private let queue = DispatchQueue(label: "com.vorssaint.agent-usage", qos: .utility, autoreleaseFrequency: .workItem)
     private let home = FileManager.default.homeDirectoryForCurrentUser
@@ -82,6 +88,9 @@ final class AgentUsageService: ObservableObject {
     private var warned: [String: (provider: AgentProvider, window: AgentLimitWindow)] = [:]
     private var budgetDay: Date?
     private var lastRootCheck = Date.distantPast
+    /// Tells whether reading moved on since progress was last saved.
+    private var savedMark = 0
+    private var lastSave = Date.distantPast
 
     private init() {}
 
@@ -115,6 +124,7 @@ final class AgentUsageService: ObservableObject {
             poller?.cancel()
             poller = nil
             watcher?.stop()
+            saveProgress()
         }
     }
 
@@ -133,11 +143,17 @@ final class AgentUsageService: ObservableObject {
     }
 
     func stop() {
+        // Turned off, the section keeps nothing, even from an earlier launch.
+        let keeps = NotchAgentSupport.isEnabled()
+        if !keeps { queue.async { AgentUsageArchive.remove() } }
         guard running else { return }
+        cancellation.cancel()
+        // Quitting stops here too, so progress is saved before the process
+        // ends. A first read still going stops at its next chunk.
+        if keeps { queue.sync { saveProgress() } }
         running = false
         paused = false
         session += 1
-        cancellation.cancel()
         timer?.invalidate()
         timer = nil
         providers = []
@@ -164,6 +180,8 @@ final class AgentUsageService: ObservableObject {
             claudeProfileModified = nil
             claudeAppModified = nil
             claudeAppSamples = []
+            savedMark = 0
+            lastSave = .distantPast
         }
     }
 
@@ -197,8 +215,23 @@ final class AgentUsageService: ObservableObject {
             cursors.removeAll()
             // Prices first, so the first read is already priced.
             loadPrices()
+            let horizon = Date().addingTimeInterval(-Self.horizon)
+            // Resumes where the last launch stopped. A log replaced or cut
+            // short meanwhile is read from its start again, and responses
+            // already counted merge rather than add up.
+            if let saved = AgentUsageArchive.load(), saved.providers == providers {
+                store = AgentUsageStore(saved: saved.store)
+                store.reprice()
+                store.dropRecords(before: horizon)
+                for cursor in saved.cursors { cursors[cursor.path] = AgentLogCursor(saved: cursor) }
+                savedMark = progressMark
+            }
             let roots = AgentLogRoot.all(home: home).filter { providers.contains($0.provider) }
-            for file in AgentLogReader.discover(roots, since: Date().addingTimeInterval(-Self.horizon)) {
+            let files = AgentLogReader.discover(roots, since: horizon)
+            // A log gone or grown too old has nothing left to add.
+            let found = Set(files.map(\.path))
+            cursors = cursors.filter { found.contains($0.key) }
+            for file in files {
                 // A stop while reading leaves the rest for the next start.
                 guard !cancellation.isCancelled else { return }
                 read(file.path, provider: file.provider)
@@ -221,6 +254,30 @@ final class AgentUsageService: ObservableObject {
             watch(roots)
             startPolling()
             publish()
+            saveProgress()
+        }
+    }
+
+    /// Saves what was read, when reading moved on since the last save. Runs
+    /// on `queue`.
+    private func saveProgress() {
+        guard readerSession >= 0 else { return }
+        let mark = progressMark
+        lastSave = Date()
+        guard mark != savedMark else { return }
+        let contents = AgentUsageArchive.Contents(providers: enabled, store: store.saved,
+                                                  cursors: cursors.values.map(\.saved))
+        if AgentUsageArchive.save(contents) { savedMark = mark }
+    }
+
+    /// Changes whenever a log is read further, replaced or let go.
+    private var progressMark: Int {
+        cursors.values.reduce(store.records.count) { mark, cursor in
+            var hasher = Hasher()
+            hasher.combine(cursor.path)
+            hasher.combine(cursor.offset)
+            hasher.combine(cursor.identity)
+            return mark &+ hasher.finalize()
         }
     }
 
@@ -359,6 +416,7 @@ final class AgentUsageService: ObservableObject {
             readClaudeApp(now: now)
             checkLimits()
             reportRenewals(now: now)
+            if now.timeIntervalSince(lastSave) >= Self.saveInterval { saveProgress() }
             // Publish only when stored values or sliding time windows change.
             if changed || inputs != before || AgentUsageSummary.movesWithClock(published, now: now) {
                 schedulePublish()
