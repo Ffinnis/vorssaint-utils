@@ -65,7 +65,7 @@ enum AgentUsageArchiveTests {
         // The next launch picks up there while the agent keeps writing.
         write(firstHalf + secondHalf)
         let resumed = AgentUsageStore(saved: decoded?.store ?? .init())
-        let restored = decoded?.cursors.first.map(AgentLogCursor.init(saved:))
+        let restored = decoded?.cursors.first.flatMap(AgentLogCursor.init(saved:))
         var resumedLines = 0
         if let restored {
             AgentLogReader.readAppended(restored) { line in
@@ -104,13 +104,96 @@ enum AgentUsageArchiveTests {
         let damaged = [Data(), data.prefix(4), data.prefix(data.count / 2), data.dropLast(), data + Data([0])]
         suite.expect(damaged.allSatisfy { AgentUsageArchive.decode($0, build: build) == nil },
                      "a short, cut or padded file reads as nothing")
+        // One changed bit can turn a count of 1 into -2 and still decode.
         var flipped = data
-        for position in stride(from: 4, to: flipped.count, by: max(1, flipped.count / 64)) {
-            flipped[position] ^= 0xFF
-            _ = AgentUsageArchive.decode(flipped, build: build)
-            flipped[position] ^= 0xFF
+        var accepted: [Int] = []
+        for position in 4..<flipped.count {
+            for bit in 0..<8 {
+                flipped[position] ^= 1 << bit
+                if AgentUsageArchive.decode(flipped, build: build) != nil { accepted.append(position) }
+                flipped[position] ^= 1 << bit
+            }
         }
-        suite.expect(AgentUsageArchive.decode(flipped, build: build) == contents,
-                     "damaged bytes are rejected without a crash")
+        suite.expect(accepted.isEmpty && AgentUsageArchive.decode(flipped, build: build) == contents,
+                     "every changed bit is rejected rather than restored as other counts")
+        var negative = contents
+        if let first = negative.store.records.first {
+            var record = first.record
+            record.tokens.output = -2
+            negative.store.records[0] = .init(key: first.key, record: record, billable: first.billable)
+        }
+        suite.expect(AgentUsageArchive.decode(AgentUsageArchive.encode(negative, build: build), build: build) == nil,
+                     "a negative count is rejected even under a valid checksum, as the parser rejects it")
+
+        // A log cut short and written again in place keeps its inode but
+        // not its contents, and here grows past where reading stopped.
+        func inode() -> UInt64 {
+            var info = stat()
+            return stat(log.path, &info) == 0 ? UInt64(info.st_ino) : 0
+        }
+        write(firstHalf + secondHalf)
+        let before = AgentLogCursor(path: log.path, provider: .codex)
+        read(before, into: AgentUsageStore())
+        let savedBefore = before.saved
+        let inodeBefore = inode()
+        suite.expect(AgentLogCursor(saved: savedBefore) != nil, "an unchanged log resumes")
+        let rewritten = [codex("2026-09-23T09:00:00.000Z", #""session_meta","payload":{"id":"s10","cwd":"/Users/me/code/api"}"#)]
+            + firstHalf.dropFirst() + secondHalf + secondHalf
+        if let handle = try? FileHandle(forWritingTo: log) {
+            try? handle.truncate(atOffset: 0)
+            try? handle.write(contentsOf: Data((rewritten.joined(separator: "\n") + "\n").utf8))
+            try? handle.close()
+        }
+        let rewrittenStore = AgentUsageStore()
+        let rewrittenCursor = AgentLogCursor(saved: savedBefore) ?? AgentLogCursor(path: log.path, provider: .codex)
+        read(rewrittenCursor, into: rewrittenStore)
+        let expected = AgentUsageStore()
+        let expectedCursor = AgentLogCursor(path: log.path, provider: .codex)
+        read(expectedCursor, into: expected)
+        suite.expect(inode() == inodeBefore && AgentLogCursor(saved: savedBefore) == nil
+                        && rewrittenStore.saved == expected.saved && rewrittenCursor.state == expectedCursor.state,
+                     "a log rewritten in place on the same inode is read again from its start, with fresh context")
+
+        // A log gone while the app was closed takes its open turn with it.
+        let pruned = AgentUsageStore(saved: first.saved)
+        pruned.forgetTurns(outside: [])
+        let kept = AgentUsageStore(saved: first.saved)
+        kept.forgetTurns(outside: [log.path])
+        suite.expect(!first.saved.turns.isEmpty && pruned.saved.turns.isEmpty && pruned.saved.waiting.isEmpty
+                        && kept.saved.turns == first.saved.turns,
+                     "restored turns of logs that are gone end, while those of logs still there stay")
+    }
+}
+
+/// The production settle method against a recording archive: turning the
+/// section off and quitting at once must still remove saved progress.
+enum AgentUsageArchiveSettleTests {
+    enum AgentUsageArchive {
+        static var removed = 0
+        static func remove() { removed += 1 }
+    }
+
+    class Fixture {
+        let queue = DispatchQueue(label: "com.vorssaint.agent-usage.settle-test")
+        var saved = 0
+        func saveProgress() { saved += 1 }
+    }
+
+    static func run(_ suite: TestSuite) {
+        defer { AgentUsageArchive.removed = 0 }
+        let host = Host()
+        // A first read still going when the section is turned off.
+        let reading = DispatchSemaphore(value: 0)
+        host.queue.async {
+            reading.signal()
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        reading.wait()
+        host.settleArchive(keeping: false)
+        suite.expect(AgentUsageArchive.removed == 1 && host.saved == 0,
+                     "turning the section off removes saved progress before stopping returns, behind a read in progress")
+        host.settleArchive(keeping: true)
+        suite.expect(AgentUsageArchive.removed == 1 && host.saved == 1,
+                     "quitting with the section on saves progress before stopping returns")
     }
 }

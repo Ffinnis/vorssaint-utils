@@ -11,8 +11,10 @@ import Foundation
 ///
 /// A compact binary layout with shared strings: months of history hold
 /// hundreds of thousands of responses that repeat a few models, folders and
-/// sessions. Anything unexpected, including a file an other build wrote,
-/// reads as nothing, and the logs are read from their start as before.
+/// sessions. A checksum covers everything after the magic, and every value
+/// read back is checked the way the parser checks it. Anything unexpected,
+/// including a file another build wrote, reads as nothing, and the logs are
+/// read from their start as before.
 enum AgentUsageArchive {
     struct Contents: Equatable {
         var providers: Set<AgentProvider>
@@ -90,6 +92,7 @@ enum AgentUsageArchive {
             body.bool(cursor.discarding)
             body.date(cursor.modified)
             body.state(cursor.state)
+            body.unsigned(cursor.fingerprint)
         }
         var data = Data(magic)
         var header = Writer()
@@ -102,12 +105,27 @@ enum AgentUsageArchive {
         }
         data.append(contentsOf: header.bytes)
         data.append(contentsOf: body.bytes)
+        let sum = checksum(header.bytes, body.bytes)
+        withUnsafeBytes(of: sum.littleEndian) { data.append(contentsOf: $0) }
         return data
     }
 
+    /// FNV-1a over the header and the body.
+    private static func checksum(_ parts: [UInt8]...) -> UInt64 {
+        var hash: UInt64 = 0xCBF2_9CE4_8422_2325
+        for part in parts {
+            for byte in part { hash = (hash ^ UInt64(byte)) &* 0x100_0000_01B3 }
+        }
+        return hash
+    }
+
     static func decode(_ data: Data, build: String) -> Contents? {
-        guard data.count > magic.count, data.prefix(magic.count).elementsEqual(magic) else { return nil }
-        var reader = Reader(bytes: Array(data.dropFirst(magic.count)))
+        let sumSize = MemoryLayout<UInt64>.size
+        guard data.count > magic.count + sumSize, data.prefix(magic.count).elementsEqual(magic) else { return nil }
+        let payload = Array(data.dropFirst(magic.count).dropLast(sumSize))
+        let sum = data.suffix(sumSize).reversed().reduce(UInt64(0)) { $0 << 8 | UInt64($1) }
+        guard checksum(payload) == sum else { return nil }
+        var reader = Reader(bytes: payload)
         do {
             guard try reader.int() == format else { return nil }
             let strings = try reader.count()
@@ -127,8 +145,8 @@ enum AgentUsageArchive {
                 let record = try reader.record()
                 let same = try reader.bool()
                 let billable = AgentBillable(tokens: same ? record.tokens : try reader.tokens(),
-                                             longCacheWrite: try reader.int(), fast: try reader.bool(),
-                                             domestic: try reader.bool(), webSearches: try reader.int())
+                                             longCacheWrite: try reader.amount(), fast: try reader.bool(),
+                                             domestic: try reader.bool(), webSearches: try reader.amount())
                 store.records.append(.init(key: key, record: record, billable: billable))
             }
             for _ in 0..<(try reader.count()) { store.limits.append(try reader.limits()) }
@@ -141,7 +159,7 @@ enum AgentUsageArchive {
                 cursors.append(AgentLogCursor.Saved(path: try reader.string(), provider: try reader.provider(),
                                                     offset: try reader.unsigned(), identity: try reader.unsigned(),
                                                     discarding: try reader.bool(), modified: try reader.date(),
-                                                    state: try reader.state()))
+                                                    state: try reader.state(), fingerprint: try reader.unsigned()))
             }
             guard reader.atEnd else { return nil }
             return Contents(providers: providers, store: store, cursors: cursors)
@@ -309,7 +327,9 @@ enum AgentUsageArchive {
         mutating func double() throws -> Double {
             var raw: UInt64 = 0
             for (shift, byte) in try take(8).enumerated() { raw |= UInt64(byte) << (8 * UInt64(shift)) }
-            return Double(bitPattern: raw)
+            let value = Double(bitPattern: raw)
+            guard value.isFinite else { throw Malformed() }
+            return value
         }
 
         mutating func date() throws -> Date { Date(timeIntervalSinceReferenceDate: try double()) }
@@ -329,9 +349,17 @@ enum AgentUsageArchive {
             return provider
         }
 
+        /// Counts are never negative in a log, and never more than the rest
+        /// of the file here.
         mutating func tokens() throws -> AgentTokens {
-            AgentTokens(input: try int(), cacheWrite: try int(), cacheRead: try int(), output: try int(),
-                        reasoning: try int())
+            AgentTokens(input: try amount(), cacheWrite: try amount(), cacheRead: try amount(),
+                        output: try amount(), reasoning: try amount())
+        }
+
+        mutating func amount() throws -> Int {
+            let value = try int()
+            guard value >= 0 else { throw Malformed() }
+            return value
         }
 
         mutating func record() throws -> AgentUsageRecord {

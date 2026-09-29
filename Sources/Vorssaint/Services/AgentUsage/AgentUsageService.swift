@@ -143,14 +143,11 @@ final class AgentUsageService: ObservableObject {
     }
 
     func stop() {
-        // Turned off, the section keeps nothing, even from an earlier launch.
-        let keeps = NotchAgentSupport.isEnabled()
-        if !keeps { queue.async { AgentUsageArchive.remove() } }
+        // A first read still going stops at its next chunk, so the wait
+        // below is short.
+        if running { cancellation.cancel() }
+        settleArchive(keeping: NotchAgentSupport.isEnabled())
         guard running else { return }
-        cancellation.cancel()
-        // Quitting stops here too, so progress is saved before the process
-        // ends. A first read still going stops at its next chunk.
-        if keeps { queue.sync { saveProgress() } }
         running = false
         paused = false
         session += 1
@@ -223,7 +220,10 @@ final class AgentUsageService: ObservableObject {
                 store = AgentUsageStore(saved: saved.store)
                 store.reprice()
                 store.dropRecords(before: horizon)
-                for cursor in saved.cursors { cursors[cursor.path] = AgentLogCursor(saved: cursor) }
+                for saved in saved.cursors {
+                    guard let cursor = AgentLogCursor(saved: saved) else { continue }
+                    cursors[saved.path] = cursor
+                }
                 savedMark = progressMark
             }
             let roots = AgentLogRoot.all(home: home).filter { providers.contains($0.provider) }
@@ -231,6 +231,8 @@ final class AgentUsageService: ObservableObject {
             // A log gone or grown too old has nothing left to add.
             let found = Set(files.map(\.path))
             cursors = cursors.filter { found.contains($0.key) }
+            // Nothing polls a log that is gone, so its turn goes now.
+            store.forgetTurns(outside: found)
             for file in files {
                 // A stop while reading leaves the rest for the next start.
                 guard !cancellation.isCancelled else { return }
@@ -255,6 +257,16 @@ final class AgentUsageService: ObservableObject {
             startPolling()
             publish()
             saveProgress()
+        }
+    }
+
+    /// Saves progress, or removes it once the section is off, even what an
+    /// earlier launch saved. Quitting stops the service too and ends the
+    /// process right after, so this returns only once the file is settled.
+    /// Main thread.
+    private func settleArchive(keeping keeps: Bool) {
+        queue.sync {
+            if keeps { saveProgress() } else { AgentUsageArchive.remove() }
         }
     }
 

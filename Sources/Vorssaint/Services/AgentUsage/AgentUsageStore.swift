@@ -96,6 +96,12 @@ final class AgentUsageStore {
         return events
     }
 
+    /// Turns of logs outside `files`, gone while the app was closed, end
+    /// without a notice, as `forget(file:)` ends them while it runs.
+    func forgetTurns(outside files: Set<String>) {
+        for file in Set(turns.keys).union(waiting.keys) where !files.contains(file) { forget(file: file) }
+    }
+
     /// A log removed while its turn ran, like a deleted chat, ends that turn
     /// without a notice: nothing finished. True when one was showing.
     @discardableResult
@@ -299,20 +305,39 @@ final class AgentLogCursor {
         let discarding: Bool
         let modified: Date
         let state: AgentLogState
+        /// Tells the log that was read from one rewritten in place, which
+        /// keeps its inode.
+        let fingerprint: UInt64
     }
+
+    /// The fingerprint last taken, reused while reading has not moved on.
+    private var fingerprinted: (offset: UInt64, identity: UInt64, value: UInt64)?
 
     var saved: Saved {
-        Saved(path: path, provider: provider, offset: discarding ? offset : offset - UInt64(pending.count),
-              identity: identity, discarding: discarding, modified: modified, state: state)
+        let end = discarding ? offset : offset - UInt64(pending.count)
+        let fingerprint: UInt64
+        if let taken = fingerprinted, taken.offset == end, taken.identity == identity {
+            fingerprint = taken.value
+        } else {
+            fingerprint = AgentLogReader.fingerprint(path, upTo: end) ?? 0
+            fingerprinted = (end, identity, fingerprint)
+        }
+        return Saved(path: path, provider: provider, offset: end, identity: identity, discarding: discarding,
+                     modified: modified, state: state, fingerprint: fingerprint)
     }
 
-    convenience init(saved: Saved) {
+    /// Nil when the log no longer holds what was read up to the saved
+    /// offset, as when it was cut short and written again in place: it is
+    /// then read from its start.
+    convenience init?(saved: Saved) {
+        guard AgentLogReader.fingerprint(saved.path, upTo: saved.offset) == saved.fingerprint else { return nil }
         self.init(path: saved.path, provider: saved.provider)
         offset = saved.offset
         identity = saved.identity
         discarding = saved.discarding
         modified = saved.modified
         state = saved.state
+        fingerprinted = (saved.offset, saved.identity, saved.fingerprint)
     }
 
     /// Claude Code keeps a session's subagents in `<session>/subagents/`,
@@ -330,6 +355,31 @@ enum AgentLogReader {
     static let maximumLine = 32 << 20
 
     static func isLog(_ path: String) -> Bool { path.hasSuffix(".jsonl") }
+
+    /// A hash of the log's first and last few kilobytes before `offset`, and
+    /// of the offset itself. A log rewritten with a different start, or
+    /// different lines just before where reading stopped, no longer matches.
+    /// Nil when the file cannot be read that far.
+    static func fingerprint(_ path: String, upTo offset: UInt64) -> UInt64? {
+        let descriptor = open(path, O_RDONLY | O_CLOEXEC)
+        guard descriptor >= 0 else { return nil }
+        defer { close(descriptor) }
+        let span: UInt64 = 4096
+        // FNV-1a: stable across launches, unlike `Hasher`.
+        var hash: UInt64 = 0xCBF2_9CE4_8422_2325
+        func mix(_ bytes: UnsafeRawBufferPointer) {
+            for byte in bytes { hash = (hash ^ UInt64(byte)) &* 0x100_0000_01B3 }
+        }
+        withUnsafeBytes(of: offset.littleEndian, mix)
+        var buffer = [UInt8](repeating: 0, count: Int(span))
+        for start in [0, offset - min(span, offset)] {
+            let length = Int(min(span, offset - start))
+            let read = buffer.withUnsafeMutableBytes { pread(descriptor, $0.baseAddress, length, off_t(start)) }
+            guard read == length else { return nil }
+            buffer.withUnsafeBytes { mix(UnsafeRawBufferPointer(rebasing: $0[..<length])) }
+        }
+        return hash
+    }
 
     /// Log files changed since `horizon`, newest last so live turns settle
     /// on the most recent state. Subagents come after every session, so the
