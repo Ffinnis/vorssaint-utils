@@ -272,7 +272,11 @@ enum AgentUsageArchive {
                 optional(window.resetsAt) { $0.date($1) }
             }
             date(value.observedAt)
-            bool(value.source == .claudeApp)
+            switch value.source {
+            case .sessionLog: count(0)
+            case .claudeApp: count(1)
+            case .account: count(2)
+            }
         }
 
         mutating func session(_ value: AgentLiveSession) {
@@ -409,8 +413,15 @@ enum AgentUsageArchive {
                                                 scope: try optional { try $0.string() }, usedPercent: try double(),
                                                 resetsAt: try optional { try $0.date() }))
             }
-            return AgentLimits(provider: provider, windows: windows, observedAt: try date(),
-                               source: try bool() ? .claudeApp : .sessionLog)
+            let observed = try date()
+            let source: AgentLimits.Source
+            switch try unsigned() {
+            case 0: source = .sessionLog
+            case 1: source = .claudeApp
+            case 2: source = .account
+            default: throw Malformed()
+            }
+            return AgentLimits(provider: provider, windows: windows, observedAt: observed, source: source)
         }
 
         mutating func session() throws -> AgentLiveSession {

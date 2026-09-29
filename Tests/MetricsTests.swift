@@ -29,6 +29,7 @@ struct MetricsTests {
                 PointerScreenContract.run(suite)
             }),
             ("scroll-modifier", { ScrollHorizontalModifierTests.run(suite) }),
+            ("linear-scroll", { LinearScrollTapTests.run(suite) }),
             ("preferences", { PreferencesFeatureTests.run(suite) }),
             ("app-management", { AppManagementFeatureTests.run(suite) }),
             ("window-layout", { WindowLayoutFeatureTests.run(suite) }),
@@ -38,6 +39,7 @@ struct MetricsTests {
                 MixerOutputAdjustmentContract.run(suite)
                 SoundOutputSwitchContract.run(suite)
                 MixerInputVolumeContract.run(suite)
+                MixerPercentKeyTests.run(suite)
                 MixerFeatureTests.run(suite)
             }),
             ("audio-priority", { AudioPriorityTests.run(suite) }),
@@ -68,12 +70,16 @@ struct MetricsTests {
             ("notch", {
                 NotchTests.run(suite)
                 NotchCompactTests.run(suite)
+                NotchCapsuleTests.run(suite)
                 NotchVolumeKeyTests.run(suite)
                 NotchSettingsTabRowTests.run(suite)
             }),
             ("switcher-model", { SwitcherModelFeatureTests.run(suite) }),
             ("agents", { NotchAgentTests.run(suite) }),
-            ("features", { FeatureCatalogTests.run(suite) }),
+            ("features", {
+                FeatureCatalogTests.run(suite)
+                MenuPanelSectionGateContract.run(suite)
+            }),
             ("utilities", {
                 UtilitiesFeatureTests.run(suite)
                 PortManagerRefreshTests.run(suite)
@@ -101,6 +107,7 @@ struct MetricsTests {
                 ScratchpadStoreContractTests.run(suite)
             }),
             ("quit-protection", { QuitProtectionHUD.progressChecks(suite) }),
+            ("scratchpad", { ScratchpadMarkTests.run { suite.expect($0, $1) } }),
             ("recording", {
                 RecorderSampleTimingTests.run(suite)
                 RecorderWriterTests.run(suite)
@@ -111,7 +118,10 @@ struct MetricsTests {
                 SpeedTestTests.run(suite)
                 NetworkAddressTests.run { suite.expect($0, $1) }
             }),
-            ("app-updates", { AppUpdatesContract.run(suite) }),
+            ("app-updates", {
+                AppUpdatesContract.run(suite)
+                AppUpdateRulesContract.run(suite)
+            }),
             ("localization", {
                 LocalizationTests.run(suite)
                 LocalizationFeatureContractTests.run(suite)

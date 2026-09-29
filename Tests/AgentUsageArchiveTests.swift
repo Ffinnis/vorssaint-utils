@@ -58,6 +58,12 @@ enum AgentUsageArchiveTests {
         let data = AgentUsageArchive.encode(contents, build: build)
         let decoded = AgentUsageArchive.decode(data, build: build)
         suite.expect(decoded == contents, "saved progress reads back as it was written")
+        var sourced = contents
+        sourced.store.limits = [AgentLimits.Source.sessionLog, .claudeApp, .account].map {
+            AgentLimits(provider: .codex, windows: [], observedAt: now, source: $0)
+        }
+        suite.expect(AgentUsageArchive.decode(AgentUsageArchive.encode(sourced, build: build), build: build) == sourced,
+                     "limits keep where they came from: a log, the Claude app or the account")
         suite.expect(!first.saved.records.isEmpty && !first.saved.limits.isEmpty && first.saved.codexPlan != nil
                         && !first.saved.turns.isEmpty && cursor.state.fast && !cursor.state.model.isEmpty,
                      "the fixture saves records, limits, a plan, an open turn and parser context")
