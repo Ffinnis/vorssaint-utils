@@ -50,18 +50,30 @@ enum AgentUsageArchive {
     }
 
     /// The store and cursors a launch resumes with, given the logs `found`
-    /// now. A log gone, replaced or rewritten since gives back what it gave,
-    /// as reading every log from its start would leave it, and one still
-    /// there is read from its start again.
-    static func resume(_ contents: Contents, logs found: Set<String>)
-        -> (store: AgentUsageStore, cursors: [String: AgentLogCursor]) {
+    /// now, left as reading every log from its start would leave them. A log
+    /// gone, replaced or rewritten since gives back what it gave, and one
+    /// still there is read from its start again. A response it shared with
+    /// another log kept the largest count either gave, so those logs are read
+    /// again too. Limits and the plan describe the account when they were
+    /// read, not the log, so the latest reading stays: a fresh read would
+    /// fall back to an older one. `unchanged` tells whether the result is
+    /// still what was saved.
+    static func resume(_ contents: Contents, logs found: Set<String>, since horizon: Date)
+        -> (store: AgentUsageStore, cursors: [String: AgentLogCursor], unchanged: Bool) {
         let store = AgentUsageStore(saved: contents.store)
         var cursors: [String: AgentLogCursor] = [:]
         for saved in contents.cursors where found.contains(saved.path) {
             cursors[saved.path] = AgentLogCursor(saved: saved)
         }
-        store.forget(files: store.files.subtracting(cursors.keys))
-        return (store, cursors)
+        var gone = store.files.subtracting(cursors.keys)
+        let sharing = store.files(sharingWith: gone).subtracting(gone)
+        for file in sharing { cursors[file] = nil }
+        gone.formUnion(sharing)
+        store.forget(files: gone)
+        // Prices may be newer than the ones the counts were saved with.
+        store.reprice()
+        store.dropRecords(before: horizon)
+        return (store, cursors, cursors.count == contents.cursors.count && store.saved == contents.store)
     }
 
     static func remove() {

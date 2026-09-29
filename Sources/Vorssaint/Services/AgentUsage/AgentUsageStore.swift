@@ -251,6 +251,13 @@ final class AgentUsageStore {
         if emptied { keepRecords { !sources[$0].isEmpty } }
     }
 
+    /// The logs holding a response that one of `files` also holds.
+    func files(sharingWith files: Set<String>) -> Set<String> {
+        var sharing = Set<String>()
+        for list in sources where list.contains(where: files.contains) { sharing.formUnion(list) }
+        return sharing
+    }
+
     /// Every log that gave a response or holds a turn.
     var files: Set<String> {
         Set(sources.joined()).union(turns.keys).union(waiting.keys)

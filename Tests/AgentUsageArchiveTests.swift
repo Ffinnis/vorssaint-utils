@@ -145,8 +145,9 @@ enum AgentUsageArchiveTests {
         write(firstHalf + secondHalf)
         let original = saving(readFresh([log]))
         let inodeBefore = inode()
-        suite.expect(AgentUsageArchive.resume(original, logs: [log.path]).cursors[log.path] != nil,
-                     "an unchanged log resumes")
+        let unchanged = AgentUsageArchive.resume(original, logs: [log.path], since: .distantPast)
+        suite.expect(unchanged.cursors[log.path] != nil && unchanged.unchanged,
+                     "an unchanged log resumes, with nothing left to save")
         let rewritten = (firstHalf + secondHalf + secondHalf)
             .map { $0.replacingOccurrences(of: #""response_id":"r"#, with: #""response_id":"x"#) }
         if let handle = try? FileHandle(forWritingTo: log) {
@@ -154,7 +155,7 @@ enum AgentUsageArchiveTests {
             try? handle.write(contentsOf: Data((rewritten.joined(separator: "\n") + "\n").utf8))
             try? handle.close()
         }
-        let afterRewrite = AgentUsageArchive.resume(original, logs: [log.path])
+        let afterRewrite = AgentUsageArchive.resume(original, logs: [log.path], since: .distantPast)
         let again = afterRewrite.cursors[log.path] ?? AgentLogCursor(path: log.path, provider: .codex)
         read(again, into: afterRewrite.store)
         let rewrittenFresh = readFresh([log])
@@ -164,21 +165,33 @@ enum AgentUsageArchiveTests {
                      "a log rewritten in place on the same inode counts only what it holds now, with fresh context")
 
         // A session resumed into a new log repeats a response the old one
-        // holds. With the old log deleted while the app was closed, what the
-        // new one holds stays and what only the old one gave goes.
+        // holds, here with a smaller count, as when copied mid-stream. With
+        // the old log deleted while the app was closed, what the new one holds
+        // stays at its own count and what only the old one gave goes.
         write(firstHalf + secondHalf)
         let other = folder.appending(path: "rollout-resumed.jsonl")
-        try? Data(((Array(firstHalf.prefix(3)) + [secondHalf[0], secondHalf[2]]).joined(separator: "\n") + "\n").utf8)
+        let copied = secondHalf[0].replacingOccurrences(of: #""output_tokens":20"#, with: #""output_tokens":5"#)
+        try? Data(((Array(firstHalf.prefix(3)) + [copied, secondHalf[2]]).joined(separator: "\n") + "\n").utf8)
             .write(to: other)
         let both = saving(readFresh([log, other]))
         try? FileManager.default.removeItem(at: log)
-        let afterDelete = AgentUsageArchive.resume(both, logs: [other.path])
+        let afterDelete = AgentUsageArchive.resume(both, logs: [other.path], since: .distantPast)
+        let reread = afterDelete.cursors[other.path] ?? AgentLogCursor(path: other.path, provider: .codex)
+        read(reread, into: afterDelete.store)
         let onlyOther = readFresh([other])
-        suite.expect(both.store.records.count == 2 && afterDelete.store.saved.records == onlyOther.store.saved.records
-                        && afterDelete.cursors.keys.sorted() == [other.path],
-                     "a deleted log takes back the responses only it held, and those another log repeats stay")
-        let gone = AgentUsageArchive.resume(contents, logs: [])
-        suite.expect(!contents.store.turns.isEmpty && gone.store.saved.records.isEmpty
+        let resumedAfterDelete = afterDelete.store.saved
+        suite.expect(both.store.records.count == 2 && !afterDelete.unchanged && afterDelete.cursors.isEmpty
+                        && resumedAfterDelete.records == onlyOther.store.saved.records
+                        && resumedAfterDelete.turns == onlyOther.store.saved.turns
+                        && resumedAfterDelete.waiting == onlyOther.store.saved.waiting,
+                     "a deleted log takes back what only it held, and a log sharing a response is read again for its own count")
+        // Limits and the plan describe the account when they were read, not
+        // the log; the latest reading stays rather than an older one.
+        suite.expect(resumedAfterDelete.limits == both.store.limits && resumedAfterDelete.codexPlan == both.store.codexPlan
+                        && resumedAfterDelete.codexPlan != nil,
+                     "the account's latest limits and plan stay when the log they came in is deleted")
+        let gone = AgentUsageArchive.resume(contents, logs: [], since: .distantPast)
+        suite.expect(!contents.store.turns.isEmpty && !gone.unchanged && gone.store.saved.records.isEmpty
                         && gone.store.saved.turns.isEmpty && gone.store.saved.waiting.isEmpty,
                      "a log gone takes its open turn with it, since nothing polls it any more")
     }

@@ -219,10 +219,10 @@ final class AgentUsageService: ObservableObject {
             let files = AgentLogReader.discover(roots, since: horizon)
             // Resumes where the last launch stopped, among the logs there now.
             if let saved = AgentUsageArchive.load(), saved.providers == providers {
-                (store, cursors) = AgentUsageArchive.resume(saved, logs: Set(files.map(\.path)))
-                store.reprice()
-                store.dropRecords(before: horizon)
-                savedMark = progressMark
+                let resumed = AgentUsageArchive.resume(saved, logs: Set(files.map(\.path)), since: horizon)
+                (store, cursors) = (resumed.store, resumed.cursors)
+                // What the resume took back leaves the disk at the next save.
+                if resumed.unchanged { savedMark = progressMark }
             }
             for file in files {
                 // A stop while reading leaves the rest for the next start.
