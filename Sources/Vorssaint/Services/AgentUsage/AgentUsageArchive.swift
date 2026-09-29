@@ -49,6 +49,21 @@ enum AgentUsageArchive {
         return PrivateFileStore.write(encode(contents, build: build), to: url)
     }
 
+    /// The store and cursors a launch resumes with, given the logs `found`
+    /// now. A log gone, replaced or rewritten since gives back what it gave,
+    /// as reading every log from its start would leave it, and one still
+    /// there is read from its start again.
+    static func resume(_ contents: Contents, logs found: Set<String>)
+        -> (store: AgentUsageStore, cursors: [String: AgentLogCursor]) {
+        let store = AgentUsageStore(saved: contents.store)
+        var cursors: [String: AgentLogCursor] = [:]
+        for saved in contents.cursors where found.contains(saved.path) {
+            cursors[saved.path] = AgentLogCursor(saved: saved)
+        }
+        store.forget(files: store.files.subtracting(cursors.keys))
+        return (store, cursors)
+    }
+
     static func remove() {
         guard let url else { return }
         try? FileManager.default.removeItem(at: url)
@@ -74,6 +89,8 @@ enum AgentUsageArchive {
             body.bool(entry.billable.fast)
             body.bool(entry.billable.domestic)
             body.int(entry.billable.webSearches)
+            body.count(entry.sources.count)
+            for source in entry.sources { body.string(source) }
         }
         body.count(store.limits.count)
         for limits in store.limits { body.limits(limits) }
@@ -147,7 +164,9 @@ enum AgentUsageArchive {
                 let billable = AgentBillable(tokens: same ? record.tokens : try reader.tokens(),
                                              longCacheWrite: try reader.amount(), fast: try reader.bool(),
                                              domestic: try reader.bool(), webSearches: try reader.amount())
-                store.records.append(.init(key: key, record: record, billable: billable))
+                var sources: [String] = []
+                for _ in 0..<(try reader.count()) { sources.append(try reader.string()) }
+                store.records.append(.init(key: key, record: record, billable: billable, sources: sources))
             }
             for _ in 0..<(try reader.count()) { store.limits.append(try reader.limits()) }
             store.codexPlan = try reader.optional { try $0.string() }

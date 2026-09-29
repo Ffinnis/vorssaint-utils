@@ -1146,6 +1146,12 @@ def main():
                         "    private var shouldScroll:").replace("private var", "var", 1)
           + "}\n}\n")
 
+    write("AgentUsageArchiveSave.swift", "import Foundation\n"
+          + "extension AgentUsageArchiveSaveTests {\nfinal class Host: Fixture {\n"
+          + declaration("Sources/Vorssaint/Services/AgentUsage/AgentUsageService.swift",
+                        "    private func saveProgress(").replace("private func", "func", 1)
+          + "}\n}\n")
+
     write("AgentUsageArchiveSettle.swift", "import Foundation\n"
           + "extension AgentUsageArchiveSettleTests {\nfinal class Host: Fixture {\n"
           + declaration("Sources/Vorssaint/Services/AgentUsage/AgentUsageService.swift",

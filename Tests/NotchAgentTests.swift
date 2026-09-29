@@ -26,6 +26,7 @@ enum NotchAgentTests {
         AgentUsageReadTests.run(suite)
         AgentUsageArchiveTests.run(suite)
         AgentUsageArchiveSettleTests.run(suite)
+        AgentUsageArchiveSaveTests.run(suite)
         claudeApp(suite)
         preferences(suite)
         formatting(suite)

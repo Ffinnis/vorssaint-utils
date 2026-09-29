@@ -89,7 +89,9 @@ final class AgentUsageService: ObservableObject {
     private var budgetDay: Date?
     private var lastRootCheck = Date.distantPast
     /// Tells whether reading moved on since progress was last saved.
-    private var savedMark = 0
+    /// Nil until this reading saved or resumed progress: the first save
+    /// always replaces what is on disk, which may hold agents now off.
+    private var savedMark: Int?
     private var lastSave = Date.distantPast
 
     private init() {}
@@ -177,7 +179,7 @@ final class AgentUsageService: ObservableObject {
             claudeProfileModified = nil
             claudeAppModified = nil
             claudeAppSamples = []
-            savedMark = 0
+            savedMark = nil
             lastSave = .distantPast
         }
     }
@@ -213,26 +215,15 @@ final class AgentUsageService: ObservableObject {
             // Prices first, so the first read is already priced.
             loadPrices()
             let horizon = Date().addingTimeInterval(-Self.horizon)
-            // Resumes where the last launch stopped. A log replaced or cut
-            // short meanwhile is read from its start again, and responses
-            // already counted merge rather than add up.
-            if let saved = AgentUsageArchive.load(), saved.providers == providers {
-                store = AgentUsageStore(saved: saved.store)
-                store.reprice()
-                store.dropRecords(before: horizon)
-                for saved in saved.cursors {
-                    guard let cursor = AgentLogCursor(saved: saved) else { continue }
-                    cursors[saved.path] = cursor
-                }
-                savedMark = progressMark
-            }
             let roots = AgentLogRoot.all(home: home).filter { providers.contains($0.provider) }
             let files = AgentLogReader.discover(roots, since: horizon)
-            // A log gone or grown too old has nothing left to add.
-            let found = Set(files.map(\.path))
-            cursors = cursors.filter { found.contains($0.key) }
-            // Nothing polls a log that is gone, so its turn goes now.
-            store.forgetTurns(outside: found)
+            // Resumes where the last launch stopped, among the logs there now.
+            if let saved = AgentUsageArchive.load(), saved.providers == providers {
+                (store, cursors) = AgentUsageArchive.resume(saved, logs: Set(files.map(\.path)))
+                store.reprice()
+                store.dropRecords(before: horizon)
+                savedMark = progressMark
+            }
             for file in files {
                 // A stop while reading leaves the rest for the next start.
                 guard !cancellation.isCancelled else { return }

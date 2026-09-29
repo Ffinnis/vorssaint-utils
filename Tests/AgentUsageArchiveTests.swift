@@ -120,48 +120,67 @@ enum AgentUsageArchiveTests {
         if let first = negative.store.records.first {
             var record = first.record
             record.tokens.output = -2
-            negative.store.records[0] = .init(key: first.key, record: record, billable: first.billable)
+            negative.store.records[0] = .init(key: first.key, record: record, billable: first.billable,
+                                            sources: first.sources)
         }
         suite.expect(AgentUsageArchive.decode(AgentUsageArchive.encode(negative, build: build), build: build) == nil,
                      "a negative count is rejected even under a valid checksum, as the parser rejects it")
 
         // A log cut short and written again in place keeps its inode but
-        // not its contents, and here grows past where reading stopped.
+        // not its contents, and here grows past where reading stopped. The
+        // next launch counts only what it holds now, as a fresh read would.
         func inode() -> UInt64 {
             var info = stat()
             return stat(log.path, &info) == 0 ? UInt64(info.st_ino) : 0
         }
+        func readFresh(_ paths: [URL]) -> (store: AgentUsageStore, cursors: [AgentLogCursor]) {
+            let store = AgentUsageStore()
+            let cursors = paths.map { AgentLogCursor(path: $0.path, provider: .codex) }
+            cursors.forEach { read($0, into: store) }
+            return (store, cursors)
+        }
+        func saving(_ read: (store: AgentUsageStore, cursors: [AgentLogCursor])) -> AgentUsageArchive.Contents {
+            AgentUsageArchive.Contents(providers: [.codex], store: read.store.saved, cursors: read.cursors.map(\.saved))
+        }
         write(firstHalf + secondHalf)
-        let before = AgentLogCursor(path: log.path, provider: .codex)
-        read(before, into: AgentUsageStore())
-        let savedBefore = before.saved
+        let original = saving(readFresh([log]))
         let inodeBefore = inode()
-        suite.expect(AgentLogCursor(saved: savedBefore) != nil, "an unchanged log resumes")
-        let rewritten = [codex("2026-09-23T09:00:00.000Z", #""session_meta","payload":{"id":"s10","cwd":"/Users/me/code/api"}"#)]
-            + firstHalf.dropFirst() + secondHalf + secondHalf
+        suite.expect(AgentUsageArchive.resume(original, logs: [log.path]).cursors[log.path] != nil,
+                     "an unchanged log resumes")
+        let rewritten = (firstHalf + secondHalf + secondHalf)
+            .map { $0.replacingOccurrences(of: #""response_id":"r"#, with: #""response_id":"x"#) }
         if let handle = try? FileHandle(forWritingTo: log) {
             try? handle.truncate(atOffset: 0)
             try? handle.write(contentsOf: Data((rewritten.joined(separator: "\n") + "\n").utf8))
             try? handle.close()
         }
-        let rewrittenStore = AgentUsageStore()
-        let rewrittenCursor = AgentLogCursor(saved: savedBefore) ?? AgentLogCursor(path: log.path, provider: .codex)
-        read(rewrittenCursor, into: rewrittenStore)
-        let expected = AgentUsageStore()
-        let expectedCursor = AgentLogCursor(path: log.path, provider: .codex)
-        read(expectedCursor, into: expected)
-        suite.expect(inode() == inodeBefore && AgentLogCursor(saved: savedBefore) == nil
-                        && rewrittenStore.saved == expected.saved && rewrittenCursor.state == expectedCursor.state,
-                     "a log rewritten in place on the same inode is read again from its start, with fresh context")
+        let afterRewrite = AgentUsageArchive.resume(original, logs: [log.path])
+        let again = afterRewrite.cursors[log.path] ?? AgentLogCursor(path: log.path, provider: .codex)
+        read(again, into: afterRewrite.store)
+        let rewrittenFresh = readFresh([log])
+        suite.expect(inode() == inodeBefore && afterRewrite.cursors.isEmpty
+                        && afterRewrite.store.saved == rewrittenFresh.store.saved
+                        && again.state == rewrittenFresh.cursors.first?.state,
+                     "a log rewritten in place on the same inode counts only what it holds now, with fresh context")
 
-        // A log gone while the app was closed takes its open turn with it.
-        let pruned = AgentUsageStore(saved: first.saved)
-        pruned.forgetTurns(outside: [])
-        let kept = AgentUsageStore(saved: first.saved)
-        kept.forgetTurns(outside: [log.path])
-        suite.expect(!first.saved.turns.isEmpty && pruned.saved.turns.isEmpty && pruned.saved.waiting.isEmpty
-                        && kept.saved.turns == first.saved.turns,
-                     "restored turns of logs that are gone end, while those of logs still there stay")
+        // A session resumed into a new log repeats a response the old one
+        // holds. With the old log deleted while the app was closed, what the
+        // new one holds stays and what only the old one gave goes.
+        write(firstHalf + secondHalf)
+        let other = folder.appending(path: "rollout-resumed.jsonl")
+        try? Data(((Array(firstHalf.prefix(3)) + [secondHalf[0], secondHalf[2]]).joined(separator: "\n") + "\n").utf8)
+            .write(to: other)
+        let both = saving(readFresh([log, other]))
+        try? FileManager.default.removeItem(at: log)
+        let afterDelete = AgentUsageArchive.resume(both, logs: [other.path])
+        let onlyOther = readFresh([other])
+        suite.expect(both.store.records.count == 2 && afterDelete.store.saved.records == onlyOther.store.saved.records
+                        && afterDelete.cursors.keys.sorted() == [other.path],
+                     "a deleted log takes back the responses only it held, and those another log repeats stay")
+        let gone = AgentUsageArchive.resume(contents, logs: [])
+        suite.expect(!contents.store.turns.isEmpty && gone.store.saved.records.isEmpty
+                        && gone.store.saved.turns.isEmpty && gone.store.saved.waiting.isEmpty,
+                     "a log gone takes its open turn with it, since nothing polls it any more")
     }
 }
 
@@ -195,5 +214,45 @@ enum AgentUsageArchiveSettleTests {
         host.settleArchive(keeping: true)
         suite.expect(AgentUsageArchive.removed == 1 && host.saved == 1,
                      "quitting with the section on saves progress before stopping returns")
+    }
+}
+
+typealias AgentUsageProductionArchive = AgentUsageArchive
+
+/// The production save method against a recording archive.
+enum AgentUsageArchiveSaveTests {
+    enum AgentUsageArchive {
+        typealias Contents = AgentUsageProductionArchive.Contents
+        static var saved: [Contents] = []
+        static func save(_ contents: Contents) -> Bool {
+            saved.append(contents)
+            return true
+        }
+    }
+
+    class Fixture {
+        var readerSession = 1
+        var progressMark = 0
+        var lastSave = Date.distantPast
+        var savedMark: Int?
+        var enabled: Set<AgentProvider> = [.claude]
+        var store = AgentUsageStore()
+        var cursors: [String: AgentLogCursor] = [:]
+    }
+
+    static func run(_ suite: TestSuite) {
+        defer { AgentUsageArchive.saved = [] }
+        // A provider turned off with the section still on: the reading that
+        // follows has nothing yet, and still replaces the old file.
+        let host = Host()
+        host.saveProgress()
+        suite.expect(AgentUsageArchive.saved.count == 1 && AgentUsageArchive.saved.first?.providers == [.claude]
+                        && AgentUsageArchive.saved.first?.store.records.isEmpty == true,
+                     "the first save of a reading replaces the file even with nothing read, dropping agents now off")
+        host.saveProgress()
+        suite.expect(AgentUsageArchive.saved.count == 1, "a save with nothing new since writes nothing")
+        host.progressMark = 1
+        host.saveProgress()
+        suite.expect(AgentUsageArchive.saved.count == 2, "a save after reading moved on writes again")
     }
 }

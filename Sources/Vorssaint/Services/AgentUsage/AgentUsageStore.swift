@@ -10,6 +10,9 @@ import Foundation
 final class AgentUsageStore {
     private(set) var records: [AgentUsageRecord] = []
     private var billables: [AgentBillable] = []
+    /// The logs each response was read from: most in one, a resumed or
+    /// archived session's again in another.
+    private var sources: [[String]] = []
     private var index: [String: Int] = [:]
     private let summary = AgentUsageSummaryCache()
     private(set) var limits: [AgentProvider: AgentLimits] = [:]
@@ -50,7 +53,8 @@ final class AgentUsageStore {
         for entry in entries {
             switch entry {
             case .usage(let key, let record, let billable):
-                add(record, billable: billable, key: key, turn: tracksTurns ? file : parent, subagent: !tracksTurns)
+                add(record, billable: billable, key: key, source: file, turn: tracksTurns ? file : parent,
+                    subagent: !tracksTurns)
             case .limits(let reading):
                 if (limits[reading.provider]?.observedAt ?? .distantPast) <= reading.observedAt {
                     limits[reading.provider] = reading
@@ -96,12 +100,6 @@ final class AgentUsageStore {
         return events
     }
 
-    /// Turns of logs outside `files`, gone while the app was closed, end
-    /// without a notice, as `forget(file:)` ends them while it runs.
-    func forgetTurns(outside files: Set<String>) {
-        for file in Set(turns.keys).union(waiting.keys) where !files.contains(file) { forget(file: file) }
-    }
-
     /// A log removed while its turn ran, like a deleted chat, ends that turn
     /// without a notice: nothing finished. True when one was showing.
     @discardableResult
@@ -110,13 +108,15 @@ final class AgentUsageStore {
         return turns.removeValue(forKey: file) != nil
     }
 
-    /// `file` names the log whose turn the response counts toward. A
-    /// subagent's responses leave that turn's model and project alone.
-    private func add(_ record: AgentUsageRecord, billable: AgentBillable, key: String, turn file: String?,
-                     subagent: Bool) {
+    /// `source` is the log the response was read from; `file` names the log
+    /// whose turn it counts toward. A subagent's responses leave that turn's
+    /// model and project alone.
+    private func add(_ record: AgentUsageRecord, billable: AgentBillable, key: String, source: String,
+                     turn file: String?, subagent: Bool) {
         var delta = record.tokens
         var extra = record.cost ?? 0
         if let position = index[key] {
+            if !sources[position].contains(source) { sources[position].append(source) }
             let old = records[position]
             let merged = old.tokens.merged(with: record.tokens)
             guard merged != old.tokens else { return }
@@ -143,6 +143,7 @@ final class AgentUsageStore {
             index[key] = records.count
             records.append(record)
             billables.append(billable)
+            sources.append([source])
         }
         guard let file, var turn = turns[file] ?? waiting[file],
               record.date >= turn.started.addingTimeInterval(-1) else { return }
@@ -194,6 +195,7 @@ final class AgentUsageStore {
             let key: String
             let record: AgentUsageRecord
             let billable: AgentBillable
+            let sources: [String]
         }
 
         var records: [Record] = []
@@ -207,7 +209,10 @@ final class AgentUsageStore {
     var saved: Saved {
         var keys = [String](repeating: "", count: records.count)
         for (key, position) in index { keys[position] = key }
-        return Saved(records: records.indices.map { Saved.Record(key: keys[$0], record: records[$0], billable: billables[$0]) },
+        let kept = records.indices.map {
+            Saved.Record(key: keys[$0], record: records[$0], billable: billables[$0], sources: sources[$0])
+        }
+        return Saved(records: kept,
                      limits: limits.values.sorted { $0.provider.rawValue < $1.provider.rawValue },
                      codexPlan: codexPlan, codexPlanObserved: codexPlanObserved,
                      turns: turns.values.sorted { $0.id < $1.id }, waiting: waiting.values.sorted { $0.id < $1.id })
@@ -217,6 +222,7 @@ final class AgentUsageStore {
         self.init()
         records = saved.records.map(\.record)
         billables = saved.records.map(\.billable)
+        sources = saved.records.map(\.sources)
         for (position, entry) in saved.records.enumerated() { index[entry.key] = position }
         limits = Dictionary(saved.limits.map { ($0.provider, $0) }, uniquingKeysWith: { $1 })
         codexPlan = saved.codexPlan
@@ -228,18 +234,44 @@ final class AgentUsageStore {
     /// Keeps memory bounded to the history the island can show.
     func dropRecords(before date: Date) {
         guard records.contains(where: { $0.date < date }) else { return }
+        keepRecords { records[$0].date >= date }
+    }
+
+    /// Takes back what logs gone or rewritten since they were read gave, as
+    /// reading every log from its start would: a response only they held
+    /// goes, one another log also holds stays. Their turns end without a
+    /// notice.
+    func forget(files: Set<String>) {
+        for file in files { forget(file: file) }
+        var emptied = false
+        for position in sources.indices where sources[position].contains(where: files.contains) {
+            sources[position].removeAll(where: files.contains)
+            emptied = emptied || sources[position].isEmpty
+        }
+        if emptied { keepRecords { !sources[$0].isEmpty } }
+    }
+
+    /// Every log that gave a response or holds a turn.
+    var files: Set<String> {
+        Set(sources.joined()).union(turns.keys).union(waiting.keys)
+    }
+
+    private func keepRecords(where keep: (Int) -> Bool) {
         summary.invalidate()
         var kept: [AgentUsageRecord] = []
         var keptBillables: [AgentBillable] = []
+        var keptSources: [[String]] = []
         var positions: [Int: Int] = [:]
-        for (offset, record) in records.enumerated() where record.date >= date {
+        for offset in records.indices where keep(offset) {
             positions[offset] = kept.count
-            kept.append(record)
+            kept.append(records[offset])
             keptBillables.append(billables[offset])
+            keptSources.append(sources[offset])
         }
         index = index.compactMapValues { positions[$0] }
         records = kept
         billables = keptBillables
+        sources = keptSources
     }
 }
 
@@ -326,11 +358,13 @@ final class AgentLogCursor {
                      modified: modified, state: state, fingerprint: fingerprint)
     }
 
-    /// Nil when the log no longer holds what was read up to the saved
-    /// offset, as when it was cut short and written again in place: it is
-    /// then read from its start.
+    /// Nil when the path no longer holds the log that was read up to the
+    /// saved offset: replaced by another file, or cut short and written
+    /// again in place.
     convenience init?(saved: Saved) {
-        guard AgentLogReader.fingerprint(saved.path, upTo: saved.offset) == saved.fingerprint else { return nil }
+        var info = stat()
+        guard stat(saved.path, &info) == 0, UInt64(info.st_ino) == saved.identity,
+              AgentLogReader.fingerprint(saved.path, upTo: saved.offset) == saved.fingerprint else { return nil }
         self.init(path: saved.path, provider: saved.provider)
         offset = saved.offset
         identity = saved.identity
