@@ -100,8 +100,9 @@ final class AgentUsageService: ObservableObject {
         guard NotchAgentSupport.isEnabled() else { stop(); return }
         let wanted = NotchAgentSupport.providers()
         // An agent turned off is no longer read at all, and one turned on is
-        // read from its start: both take a fresh reading.
-        if running, wanted != providers { stop() }
+        // read from its start: both take a fresh reading, which would not
+        // resume progress saved for the old set, so it goes at once.
+        if running, wanted != providers { stop(keepingProgress: false) }
         if !running {
             running = true
             session += 1
@@ -144,11 +145,11 @@ final class AgentUsageService: ObservableObject {
         }
     }
 
-    func stop() {
+    func stop(keepingProgress keeps: Bool = true) {
         // A first read still going stops at its next chunk, so the wait
         // below is short.
         if running { cancellation.cancel() }
-        settleArchive(keeping: NotchAgentSupport.isEnabled())
+        settleArchive(keeping: keeps && NotchAgentSupport.isEnabled())
         guard running else { return }
         running = false
         paused = false
@@ -281,8 +282,10 @@ final class AgentUsageService: ObservableObject {
         let mark = progressMark
         lastSave = Date()
         guard mark != savedMark else { return }
+        // A log that started over while running still counts what its old
+        // contents gave. Left out, the next launch reads it as rewritten.
         let contents = AgentUsageArchive.Contents(providers: enabled, store: store.saved,
-                                                  cursors: cursors.values.map(\.saved))
+                                                  cursors: cursors.values.filter { !$0.restarted }.map(\.saved))
         if AgentUsageArchive.save(contents) { savedMark = mark }
     }
 

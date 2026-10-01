@@ -401,6 +401,10 @@ final class AgentLogCursor {
     var discarding = false
     var state = AgentLogState()
     var modified = Date.distantPast
+    /// Set when the log turned out replaced, cut short or written again after
+    /// part of it was read. What its old contents gave is still counted, so
+    /// its progress is not saved: the next launch reads it as rewritten.
+    private(set) var restarted = false
 
     init(path: String, provider: AgentProvider) {
         self.path = path
@@ -426,11 +430,41 @@ final class AgentLogCursor {
         let fingerprint: UInt64
     }
 
-    /// The fingerprint last taken, reused while reading has not moved on.
+    /// The fingerprint taken right after reading, so saved progress
+    /// describes the bytes as they were read, not as they are when saving.
     private var fingerprinted: (offset: UInt64, identity: UInt64, value: UInt64)?
 
+    /// Where a resumed read picks up: the start of a line still being
+    /// written, or past a line too long to keep.
+    private var boundary: UInt64 { discarding ? offset : offset - UInt64(pending.count) }
+
+    /// Reads the log again from its start.
+    func startOver(identity: UInt64) {
+        if offset > 0 { restarted = true }
+        self.identity = identity
+        offset = 0
+        pending = Data()
+        discarding = false
+        state = AgentLogState()
+        fingerprinted = nil
+    }
+
+    func fingerprintRead() {
+        let end = boundary
+        if let taken = fingerprinted, taken.offset == end, taken.identity == identity { return }
+        fingerprinted = AgentLogReader.fingerprint(path, upTo: end).map { (end, identity, $0) }
+    }
+
+    /// False once the log no longer holds what was read: written again in
+    /// place, perhaps past where reading stopped, which its size and inode
+    /// alone do not show.
+    var holdsWhatWasRead: Bool {
+        guard let taken = fingerprinted, taken.identity == identity else { return true }
+        return AgentLogReader.fingerprint(path, upTo: taken.offset) == taken.value
+    }
+
     var saved: Saved {
-        let end = discarding ? offset : offset - UInt64(pending.count)
+        let end = boundary
         let fingerprint: UInt64
         if let taken = fingerprinted, taken.offset == end, taken.identity == identity {
             fingerprint = taken.value
@@ -479,9 +513,13 @@ enum AgentLogReader {
     /// different lines just before where reading stopped, no longer matches.
     /// Nil when the file cannot be read that far.
     static func fingerprint(_ path: String, upTo offset: UInt64) -> UInt64? {
-        let descriptor = open(path, O_RDONLY | O_CLOEXEC)
+        // Without O_NONBLOCK a FIFO named like a log would block the open,
+        // and a stop waiting for the usage queue with it.
+        let descriptor = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK)
         guard descriptor >= 0 else { return nil }
         defer { close(descriptor) }
+        var info = stat()
+        guard fstat(descriptor, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else { return nil }
         let span: UInt64 = 4096
         // FNV-1a: stable across launches, unlike `Hasher`.
         var hash: UInt64 = 0xCBF2_9CE4_8422_2325
@@ -530,13 +568,11 @@ enum AgentLogReader {
         let identity = UInt64(info.st_ino)
         cursor.modified = Date(timeIntervalSince1970: TimeInterval(info.st_mtimespec.tv_sec)
                                 + TimeInterval(info.st_mtimespec.tv_nsec) / 1_000_000_000)
-        if identity != cursor.identity || size < cursor.offset {
-            cursor.identity = identity
-            cursor.offset = 0
-            cursor.pending = Data()
-            cursor.discarding = false
-            cursor.state = AgentLogState()
+        if identity != cursor.identity || size < cursor.offset
+            || (size > cursor.offset && !cursor.holdsWhatWasRead) {
+            cursor.startOver(identity: identity)
         }
+        defer { cursor.fingerprintRead() }
         guard size > cursor.offset, let handle = FileHandle(forReadingAtPath: cursor.path) else { return }
         defer { try? handle.close() }
         do { try handle.seek(toOffset: cursor.offset) } catch { return }

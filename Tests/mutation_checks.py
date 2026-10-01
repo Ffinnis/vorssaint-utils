@@ -259,6 +259,17 @@ MUTATIONS = [
      "        var attributed = AttributedString(visible)\n",
      "        var attributed = AttributedString(visible)\n        attributed.foregroundColor = .primary\n",
      "a highlighted row styles only its matches and leaves the rest to its text's modifiers"),
+    ("agent log written again in place goes unnoticed", "agents",
+     "Sources/Vorssaint/Services/AgentUsage/AgentUsageStore.swift",
+     "        if identity != cursor.identity || size < cursor.offset\n"
+     "            || (size > cursor.offset && !cursor.holdsWhatWasRead) {\n",
+     "        if identity != cursor.identity || size < cursor.offset {\n",
+     "a log written again in place while the app runs is read again at once"),
+    ("agent progress keeps a log that started over", "agents",
+     "Sources/Vorssaint/Services/AgentUsage/AgentUsageService.swift",
+     "cursors: cursors.values.filter { !$0.restarted }.map(\\.saved))",
+     "cursors: cursors.values.map(\\.saved))",
+     "a log replaced or written again while the app ran is left out of saved progress"),
 ]
 
 

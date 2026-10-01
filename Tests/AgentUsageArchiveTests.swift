@@ -200,6 +200,113 @@ enum AgentUsageArchiveTests {
         suite.expect(!contents.store.turns.isEmpty && !gone.unchanged && gone.store.saved.records.isEmpty
                         && gone.store.saved.turns.isEmpty && gone.store.saved.waiting.isEmpty,
                      "a log gone takes its open turn with it, since nothing polls it any more")
+
+        // Cut short and written again while the app runs, here past where
+        // reading stopped: neither its inode nor its size shows it. It is read
+        // again from its start at once. What its old contents gave stays
+        // counted until the next launch, so its progress is not saved, and
+        // that launch counts only what the log holds then.
+        write(firstHalf + secondHalf)
+        let live = readFresh([log])
+        let liveInode = inode()
+        if let handle = try? FileHandle(forWritingTo: log) {
+            try? handle.truncate(atOffset: 0)
+            try? handle.write(contentsOf: Data((rewritten.joined(separator: "\n") + "\n").utf8))
+            try? handle.close()
+        }
+        var liveLines = 0
+        if let liveCursor = live.cursors.first {
+            AgentLogReader.readAppended(liveCursor) { line in
+                liveLines += 1
+                let entries = AgentLogParser.parseCodex(line, state: &liveCursor.state, now: now)
+                live.store.apply(entries, file: liveCursor.path, provider: .codex, tracksTurns: liveCursor.tracksTurns,
+                                 parent: liveCursor.parent, modified: liveCursor.modified, now: now)
+            }
+        }
+        let savedWhileLive = AgentUsageArchive.Contents(providers: [.codex], store: live.store.saved,
+                                                        cursors: live.cursors.filter { !$0.restarted }.map(\.saved))
+        let relaunch = AgentUsageArchive.resume(savedWhileLive, logs: [log.path], since: .distantPast)
+        let relaunchCursor = relaunch.cursors[log.path] ?? AgentLogCursor(path: log.path, provider: .codex)
+        read(relaunchCursor, into: relaunch.store)
+        let rewrittenNow = readFresh([log])
+        suite.expect(inode() == liveInode && live.cursors.first?.restarted == true && liveLines == rewritten.count
+                        && relaunch.cursors.isEmpty && relaunch.store.saved == rewrittenNow.store.saved,
+                     "a log written again in place while the app runs is read again at once, and the next launch counts only what it holds")
+
+        // Developer builds keep the version of their release, and each one
+        // may parse differently.
+        let release: [String: Any] = ["CFBundleShortVersionString": "3.5", "CFBundleVersion": "120"]
+        var developer = release
+        developer["VorssaintBuildCommit"] = "abc1234 · 2026-10-01 09:00"
+        var rebuilt = release
+        rebuilt["VorssaintBuildCommit"] = "abc1234-dirty · 2026-10-01 09:05"
+        suite.expect(AgentUsageArchive.build(info: release) == "3.5-120"
+                        && AgentUsageArchive.build(info: developer) != AgentUsageArchive.build(info: release)
+                        && AgentUsageArchive.build(info: developer) != AgentUsageArchive.build(info: rebuilt),
+                     "a developer build keeps its progress apart from its release's and from another developer build's")
+
+        // Opening a FIFO for reading waits for a writer, and a stop waits for
+        // the usage queue: a FIFO named like a log must never be opened that way.
+        let fifo = folder.appending(path: "pipe.jsonl")
+        if mkfifo(fifo.path, 0o600) == 0 {
+            let done = DispatchSemaphore(value: 0)
+            var fingerprint: UInt64? = 1
+            DispatchQueue.global().async {
+                fingerprint = AgentLogReader.fingerprint(fifo.path, upTo: 0)
+                done.signal()
+            }
+            let returned = done.wait(timeout: .now() + 2) == .success
+            if !returned {
+                // Lets a blocked open return so the run can go on.
+                let writer = open(fifo.path, O_WRONLY | O_NONBLOCK)
+                if writer >= 0 { close(writer) }
+                _ = done.wait(timeout: .now() + 2)
+            }
+            suite.expect(returned && fingerprint == nil, "a fifo named like a log is skipped instead of waited on")
+        } else {
+            suite.expect(false, "the archive fixture creates a fifo")
+        }
+
+        // The layout lists every stored property by hand. One added later
+        // must find its place there, or the archive would drop it without a
+        // word while the restored cursors skip the lines that set it. A
+        // property that is not kept between launches is listed here too.
+        func labels(_ value: Any) -> [String] { Mirror(reflecting: value).children.compactMap(\.label) }
+        let sample = first.saved
+        guard let sampleRecord = sample.records.first, let sampleLimits = sample.limits.first,
+              let sampleWindow = sampleLimits.windows.first, let sampleTurn = sample.turns.first else {
+            suite.expect(false, "the archive fixture holds a record, limits with a window and an open turn")
+            return
+        }
+        let layouts: [(name: String, stored: [String], written: [String])] = [
+            ("AgentUsageArchive.Contents", labels(contents), ["providers", "store", "cursors"]),
+            ("AgentUsageStore", labels(first),
+             ["records", "billables", "sources", "index", "summary", "limits", "codexPlan", "codexPlanObserved",
+              "turns", "waiting", "registered", "reportsTransitions"]),
+            ("AgentUsageStore.Saved", labels(sample),
+             ["records", "limits", "codexPlan", "codexPlanObserved", "turns", "waiting"]),
+            ("AgentUsageStore.Saved.Record", labels(sampleRecord), ["key", "record", "billable", "sources"]),
+            ("AgentUsageRecord", labels(sampleRecord.record),
+             ["provider", "date", "model", "project", "session", "tokens", "cost", "savings"]),
+            ("AgentBillable", labels(sampleRecord.billable),
+             ["tokens", "longCacheWrite", "fast", "domestic", "webSearches"]),
+            ("AgentTokens", labels(sampleRecord.record.tokens), ["input", "cacheWrite", "cacheRead", "output", "reasoning"]),
+            ("AgentLimits", labels(sampleLimits), ["provider", "windows", "observedAt", "source"]),
+            ("AgentLimitWindow", labels(sampleWindow), ["id", "kind", "minutes", "scope", "usedPercent", "resetsAt"]),
+            ("AgentLiveSession", labels(sampleTurn),
+             ["id", "provider", "started", "lastActivity", "model", "project", "tokens", "cost"]),
+            ("AgentLogCursor", labels(cursor),
+             ["path", "provider", "tracksTurns", "parent", "offset", "identity", "pending", "discarding", "state",
+              "modified", "restarted", "fingerprinted"]),
+            ("AgentLogCursor.Saved", labels(cursor.saved),
+             ["path", "provider", "offset", "identity", "discarding", "modified", "state", "fingerprint"]),
+            ("AgentLogState", labels(cursor.state),
+             ["session", "project", "model", "turnOpen", "sawUsageRecords", "lastTotal", "fast"])
+        ]
+        for layout in layouts {
+            suite.expect(layout.stored == layout.written,
+                         "every stored property of \(layout.name) has its place in the archive's layout or is listed as not kept")
+        }
     }
 }
 
@@ -273,5 +380,27 @@ enum AgentUsageArchiveSaveTests {
         host.progressMark = 1
         host.saveProgress()
         suite.expect(AgentUsageArchive.saved.count == 2, "a save after reading moved on writes again")
+
+        // A log replaced while the app ran still counts what its old contents
+        // gave, so it is left out and the next launch reads it as rewritten.
+        let folder = FileManager.default.temporaryDirectory.appending(path: "vorss-archive-save-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let keptLog = folder.appending(path: "kept.jsonl")
+        let replacedLog = folder.appending(path: "replaced.jsonl")
+        try? Data("{}\n".utf8).write(to: keptLog)
+        try? Data("{}\n".utf8).write(to: replacedLog)
+        let kept = AgentLogCursor(path: keptLog.path, provider: .codex)
+        let replaced = AgentLogCursor(path: replacedLog.path, provider: .codex)
+        AgentLogReader.readAppended(kept) { _ in }
+        AgentLogReader.readAppended(replaced) { _ in }
+        try? Data("{}\n{}\n".utf8).write(to: replacedLog, options: .atomic)
+        AgentLogReader.readAppended(replaced) { _ in }
+        host.cursors = [keptLog.path: kept, replacedLog.path: replaced]
+        host.progressMark = 2
+        host.saveProgress()
+        suite.expect(replaced.restarted && !kept.restarted
+                        && AgentUsageArchive.saved.last?.cursors.map(\.path) == [keptLog.path],
+                     "a log replaced or written again while the app ran is left out of saved progress")
     }
 }

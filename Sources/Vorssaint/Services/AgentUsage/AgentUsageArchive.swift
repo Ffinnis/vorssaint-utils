@@ -4,7 +4,7 @@
 import Foundation
 
 /// The counters read so far and where reading stopped in each log, kept in
-/// the app's private folder so a launch reads only what the agents wrote
+/// the app's own cache folder so a launch reads only what the agents wrote
 /// since, instead of every log of the last thirteen weeks again. It holds
 /// what the store holds in memory and nothing more: no prompt, reply or tool
 /// output. Removed when the AI section is turned off.
@@ -28,13 +28,27 @@ enum AgentUsageArchive {
 
     /// The parser and the store change between versions; what one build
     /// read is not taken for what another would have.
-    static var build: String {
-        let info = Bundle.main.infoDictionary
-        return "\(info?["CFBundleShortVersionString"] as? String ?? "")-\(info?["CFBundleVersion"] as? String ?? "")"
+    static var build: String { build(info: Bundle.main.infoDictionary) }
+
+    /// A Developer build keeps the version of the release it comes from, so
+    /// its build stamp tells two of them apart.
+    static func build(info: [String: Any]?) -> String {
+        let version = "\(info?["CFBundleShortVersionString"] as? String ?? "")-\(info?["CFBundleVersion"] as? String ?? "")"
+        guard let stamp = info?["VorssaintBuildCommit"] as? String else { return version }
+        return "\(version) \(stamp)"
+    }
+
+    /// A cache the logs can rebuild: Time Machine leaves it out of backups,
+    /// and if macOS clears it the next launch reads the logs from their start.
+    private static var folder: URL? {
+        guard let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first,
+              let bundleID = Bundle.main.bundleIdentifier else { return nil }
+        return caches.appendingPathComponent(bundleID, isDirectory: true)
+            .appendingPathComponent("AgentUsage", isDirectory: true)
     }
 
     private static var url: URL? {
-        PrivateFileStore.containerURL?.appendingPathComponent(fileName, isDirectory: false)
+        folder?.appendingPathComponent(fileName, isDirectory: false)
     }
 
     static func load() -> Contents? {
@@ -44,8 +58,7 @@ enum AgentUsageArchive {
 
     @discardableResult
     static func save(_ contents: Contents) -> Bool {
-        guard let container = PrivateFileStore.containerURL, let url,
-              PrivateFileStore.createDirectory(at: container) else { return false }
+        guard let folder, let url, PrivateFileStore.createDirectory(at: folder, container: folder) else { return false }
         return PrivateFileStore.write(encode(contents, build: build), to: url)
     }
 
